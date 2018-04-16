@@ -6,7 +6,6 @@ import javafx.beans.property.SimpleBooleanProperty
 import javafx.beans.property.SimpleDoubleProperty
 import javafx.beans.property.StringProperty
 import javafx.geometry.Pos
-import javafx.scene.control.Alert
 import javafx.scene.control.TextArea
 import javafx.scene.image.Image
 import javafx.scene.paint.Color
@@ -15,8 +14,8 @@ import javafx.scene.text.FontWeight
 import javafx.scene.text.TextAlignment
 import javafx.stage.Stage
 import javafx.stage.StageStyle
-import org.eclipse.aether.transfer.TransferEvent
-import picocli.CommandLine
+import kotlinx.coroutines.experimental.javafx.JavaFx
+import kotlinx.coroutines.experimental.launch
 import tornadofx.*
 import java.io.OutputStream
 import java.io.PrintStream
@@ -38,7 +37,7 @@ class GravitonBrowser : App(ShellView::class, Styles::class) {
 }
 
 class ShellView : View("Graviton Browser") {
-    private val codeFetcher = CodeFetcher()
+    companion object : Logging()
 
     private val downloadProgress = SimpleDoubleProperty(0.0)
     private val isDownloading = SimpleBooleanProperty()
@@ -47,6 +46,7 @@ class ShellView : View("Graviton Browser") {
     private lateinit var messageText2: StringProperty
     private lateinit var outputArea: TextArea
 
+    // Build up the UI layouts and widgets using the TornadoFX DSL.
     override val root = stackpane {
         style {
             fontFamily = "Raleway"
@@ -90,7 +90,7 @@ class ShellView : View("Graviton Browser") {
                     fontSize = 20.pt
                     alignment = Pos.CENTER
                 }
-                text = "com.github.ricksbrown:cowsay -f tux \"Hello world!\""
+                text = commandLineArguments.defaultCoordinate
                 selectAll()
                 disableProperty().bind(isDownloading)
                 action { onNavigate(text) }
@@ -140,100 +140,63 @@ class ShellView : View("Graviton Browser") {
     private fun onNavigate(text: String) {
         if (text.isBlank()) return
 
-        val options = GravitonCLI()
-        val cli = CommandLine(options)
-        cli.isStopAtPositional = true
-        cli.parse(*text.split(' ').toTypedArray())
-        try {
-            // TODO: Rewrite this to use coroutines.
-            if (options.clearCache) codeFetcher.clearCache()
-            val packageName = (options.packageName ?: return)[0]
+        // Parse what the user entered as if it were a command line: this feature is a bit of an easter egg,
+        // but makes testing a lot easier, e.g. to force a re-download just put --clear-cache at the front.
+        val options = GravitonCLI.parse(text)
 
-            download(packageName) { classpath ->
-                try {
-                    outputArea.text = ""
-                    val oldstdout = System.out
-                    val oldstderr = System.err
-                    val printStream = PrintStream(object : OutputStream() {
-                        override fun write(b: Int) {
-                            Platform.runLater {
-                                outputArea.text += b.toChar()
-                            }
-                        }
-                    }, true)
-                    System.setOut(printStream)
-                    System.setErr(printStream)
-                    invokeMainClass(classpath, packageName, options.args) {
-                        System.setOut(oldstdout)
-                        System.setErr(oldstderr)
-                    }
-                } catch (e: Exception) {
-                    onStartError(e)
-                }
-            }
-        } catch (e: Exception) {
-            onStartError(e)
-        }
-    }
-
-    private fun onStartError(e: Exception) {
-        messageText1.set("Start failed")
-        messageText2.set(e.toString())
-        e.printStackTrace()
-    }
-
-    private fun download(text: String, andThen: (String) -> Unit) {
-        if (false) {
-            mockDownload()
-            return
-        }
-        var totalBytesToDownload = 0L
-        var totalBytesDownloaded = 0L
-        var downloadStarted = false
-        val startTime = System.nanoTime()
-        val subscription = codeFetcher.allTransferEvents.threadBridgeToFx(codeFetcher.eventExecutor).subscribe {
-            // Only care about JAR fetches.
-            val elapsedSecs = (System.nanoTime() - startTime) / 100000000 / 10.0
-            messageText1.set("[$elapsedSecs secs]")
-            messageText2.set(it.data.resource.resourceName.split('/').last())
-
-            if (it.type == TransferEvent.EventType.INITIATED) {
-                if (!downloadStarted) {
-                    downloadProgress.set(0.0)
-                    isDownloading.set(true)
-                    messageText1.set("")
-                    messageText2.set("Please wait ...")
-                    downloadStarted = true
-                }
+        // These callbacks will run on the FX event thread.
+        val events = object : CodeFetcher.Events {
+            override suspend fun onStartedDownloading(name: String) {
+                downloadProgress.set(0.0)
+                isDownloading.set(true)
+                messageText1.set("")
+                messageText2.set("Please wait ...")
             }
 
-            if (it.data.requestType == TransferEvent.RequestType.GET && it.data.resource.resourceName.endsWith(".jar")) {
-                when {
-                    it.type == TransferEvent.EventType.STARTED -> {
-                        totalBytesToDownload += it.data.resource.contentLength
-                    }
-                    it.type == TransferEvent.EventType.FAILED -> {
-                        downloadProgress.set(-1.0)
-                        alert(Alert.AlertType.ERROR, "Error", it.data.exception.message)
-                    }
-                }
-                totalBytesDownloaded += it.data.dataLength
-                val pr = totalBytesDownloaded.toDouble() / totalBytesToDownload.toDouble()
+            override suspend fun onFetch(name: String, totalBytesToDownload: Long, totalDownloadedSoFar: Long) {
+                val pr = totalDownloadedSoFar.toDouble() / totalBytesToDownload.toDouble()
                 downloadProgress.set(pr)
+                messageText1.set("DOWNLOADING")
+                messageText2.set(name)
             }
-        }
-        runAsync {
-            codeFetcher.downloadAndBuildClasspath(text)
-        } ui { classpath ->
-            subscription.unsubscribe()
-            if (downloadStarted) {
+
+            override suspend fun onStoppedDownloading() {
                 downloadProgress.set(1.0)
                 isDownloading.set(false)
                 messageText1.set("")
                 messageText2.set("")
             }
-            andThen(classpath)
         }
+
+        // Capture the output of the program and redirect it to a text area. In future we'll switch this to be a real
+        // terminal and get rid of it for graphical apps.
+        outputArea.text = ""
+        val printStream = PrintStream(object : OutputStream() {
+            override fun write(b: Int) {
+                Platform.runLater {
+                    outputArea.text += b.toChar()
+                }
+            }
+        }, true)
+
+        // Now start a coroutine that will run everything on the FX thread other than background tasks.
+        launch(JavaFx) {
+            try {
+                val appManager = HistoryManager.create()
+                AppLauncher(options, appManager, primaryStage, JavaFx, events, printStream, printStream).start()
+            } catch (e: Throwable) {
+                onStartError(e)
+            }
+        }
+    }
+
+    private fun onStartError(e: Throwable) {
+        // TODO: Handle errors much better than just splatting the exception name onto the screen!
+        isDownloading.set(false)
+        downloadProgress.set(0.0)
+        messageText1.set("Start failed")
+        messageText2.set(e.toString())
+        logger.error("Start failed", e)
     }
 
     private fun mockDownload() {
